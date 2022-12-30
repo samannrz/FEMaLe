@@ -11,9 +11,11 @@ import os
 # import PIL.ImageOps
 import numpy as np
 import tensorflow as tf
+import math
 
 import tensorflow_datasets as tfds
-
+import pandas as pd
+import pygsheets
 # from PIL import Image
 physical_devices = tf.config.list_physical_devices('GPU')
 print(f'GPU device availability: {physical_devices}')
@@ -28,16 +30,31 @@ img_size = [512, 960]
 (train_dataset_raw, val_dataset_raw), dataset_info = tfds.load(
     "glenda_coco2:4.0.0", split=["train[:95%]", "train[95%:]"], with_info=True,
     shuffle_files=True, data_dir="tensorflow_datasets"
-)
+) #Originally shuffle_files=True
 
 num_samples = dataset_info.splits['train'].num_examples
 print(f"Total number samples in GLENDA dataset: {num_samples}")
-print(dataset_info)
-
+# print(dataset_info)
+print(('size validation ='))
+print(len(val_dataset_raw))
 
 # In[ ]:
 
-
+def write_to_gsheet(service_file_path, spreadsheet_id, sheet_name, data_df):
+    """
+    this function takes data_df and writes it under spreadsheet_id
+    and sheet_name using your credentials under service_file_path
+    """
+    gc = pygsheets.authorize(service_file=service_file_path)
+    sh = gc.open_by_key(spreadsheet_id)
+    try:
+        sh.add_worksheet(sheet_name)
+    except:
+        pass
+    wks_write = sh.worksheet_by_title(sheet_name)
+    wks_write.clear('A1', None, '*')
+    wks_write.set_dataframe(data_df, (1, 1), encoding='utf-8', fit=True)
+    wks_write.frozen_rows = 1
 def normalize_with_moments(x, axes=[0, 1], epsilon=1e-8):
     mean, variance = tf.nn.moments(x, axes=axes)
     x_normed = (x - mean) / tf.sqrt(variance + epsilon)  # epsilon to avoid dividing by zero
@@ -282,9 +299,13 @@ def conv_layer_2D(input, neurons, activation, ba_norm, ba_params, dropout, strid
 
 model = Plain().create_model(num_classes)
 tf.keras.utils.plot_model(model, to_file='glenda_model/model.png', show_shapes=True)
+
+
 def myprint(s):
-    with open('glenda_model/modelsummary.txt','a') as f:
+    with open('glenda_model/modelsummary.txt', 'a') as f:
         print(s, file=f)
+
+
 model.summary(print_fn=myprint)
 
 optimizer = tf.optimizers.Adam(learning_rate=5e-4)
@@ -302,7 +323,7 @@ plt.rc('font', size=10)  # controls default text sizes
 
 
 def visualize_detections(image, boxes, classes, title, figsize=(17, 17), linewidth=1, color=[1, 1, 1]):
-    #Visualize Detections
+    # Visualize Detections
     image = np.array(image, dtype=np.uint8)
     plt.figure(figsize=figsize)
     plt.axis("off")
@@ -344,10 +365,56 @@ def dice_soft_np(y_true, y_pred, smooth=0.00001):
 
     # Calculate Soft Dice Similarity Coefficient
     dice = np.divide((2 * intersection) + smooth, y_true + y_pred + smooth)
+    # if y
+    # correction
+    for ii in range(10):
+        if y_true[ii] == 0 or y_pred[ii] == 0:
+            dice[ii] = 0
+        if y_true[ii] == 0 and y_pred[ii] == 0:
+            dice[ii] = 1
 
+
+    return dice
+def dice_soft_np_TN(y_true, y_pred, smooth=0.00001):
+    axis = (0, 1)
+
+    # Calculate required variables
+    intersection = np.multiply(y_true, y_pred)
+    intersection = np.sum(intersection, axis=axis)
+    y_true = np.sum(y_true, axis=axis)
+    y_pred = np.sum(y_pred, axis=axis)
+
+    # Calculate Soft Dice Similarity Coefficient
+    dice = np.divide((2 * intersection) + smooth, y_true + y_pred + smooth)
+    # print(type(math.nan))
+    # print(dice[0])
+    for ii in range(10):
+        if y_true[ii] == 0 or y_pred[ii] == 0:
+            dice[ii] = 0
+        if y_true[ii] == 0 and y_pred[ii] ==0:
+            dice[ii]=math.nan
     return dice
 
 
+def dice_soft_np_onlyPositive(y_true, y_pred, smooth=0.00001):
+    axis = (0, 1)
+
+    # Calculate required variables
+    intersection = np.multiply(y_true, y_pred)
+    intersection = np.sum(intersection, axis=axis)
+    y_true = np.sum(y_true, axis=axis)
+    y_pred = np.sum(y_pred, axis=axis)
+
+    # Calculate Soft Dice Similarity Coefficient
+    dice = np.divide((2 * intersection) + smooth, y_true + y_pred + smooth)
+    # print(type(math.nan))
+    # print(dice[0])
+    for ii in range(10):
+        if y_true[ii] == 0 or y_pred[ii] == 0:
+            dice[ii] = 0
+        if y_true[ii] == 0:
+            dice[ii]=math.nan
+    return dice
 # In[ ]:
 
 
@@ -360,29 +427,51 @@ cat_names = ['Adhesions.Dense', 'Adhesions.Filmy', 'Deep.Endometriosis', 'Ovaria
 
 all_dice_scores = []
 all_y_true, all_y_pred = [], []
-
 for k, sample in enumerate(val_dataset_raw):
     img_data_orig = sample['image']
     seg_data_orig = sample['segmentation']
 
     seg_data = tf.cast(seg_data_orig, dtype=tf.float32)
     img_data = tf.cast(img_data_orig, dtype=tf.float32)
-    img_data = tf.cast(img_data_orig, dtype=tf.float32)
     img_data = tf.image.resize(img_data, img_size)
     seg_data = tf.image.resize(seg_data, img_size)
-
-    neg_updates = tf.tile([0], [tf.reduce_sum(tf.cast(seg_data < 0.5, dtype=tf.int32))])
-    pos_updates = tf.tile([1], [tf.reduce_sum(tf.cast(seg_data >= 0.5, dtype=tf.int32))])
+    #
+    # print('real box')
+    # print(seg_data.shape)
+    # plt.imshow(seg_data[:, :, 0])
+    # plt.title('real data class 1')
+    # plt.show()
+    #
+    neg_updates = tf.tile([0], [tf.reduce_sum(tf.cast(seg_data < 0.5, dtype=tf.int32))]) # The out of box data
+    pos_updates = tf.tile([1], [tf.reduce_sum(tf.cast(seg_data >= 0.5, dtype=tf.int32))]) # The insode of box data
     seg_data = tf.tensor_scatter_nd_update(seg_data, tf.where(seg_data >= 0.5), tf.cast(pos_updates, dtype=tf.float32))
     seg_data = tf.tensor_scatter_nd_update(seg_data, tf.where(seg_data < 0.5), tf.cast(neg_updates, dtype=tf.float32))
 
-    pred_data = model.predict(normalize_with_moments(tf.expand_dims(img_data, 0)))
-    prediction = np.where(pred_data > 0.9, 1, 0)[0]
+    pred_data = model.predict(normalize_with_moments(tf.expand_dims(img_data, 0))) # np array= 10 images with prediction masks
+    #
+    # print(type(pred_data))
+    # print(pred_data.shape)
+    # plt.imshow(pred_data[0,:, :, 0])
+    # plt.title('prediction class 1')
+    # plt.show()
+    # plt.imshow(pred_data[0, :, :, 9])
+    # plt.title('prediction class background')
+    # plt.show()
 
-    y_true = tf.reduce_max(seg_data, axis=[0, 1]).numpy().astype(int)
-    y_pred = np.zeros((num_classes,), dtype=int)
+    prediction = np.where(pred_data > 0.9, 1, 0)[0] # np array with most probable predictions
 
-    all_dice_scores.append(dice_soft_np(seg_data.numpy(), prediction))
+    # print('prediction:')
+    # print((prediction.shape))
+    y_true = tf.reduce_max(seg_data, axis=[0, 1]).numpy().astype(int) #np array, a 10 length array with existing classes
+    # print('y_true')
+    # print((y_true.shape))
+    # print((y_true))
+    y_pred = np.zeros((num_classes,), dtype=int) # np array
+    # print('type y_pred')
+    # print((y_pred))
+
+    all_dice_scores.append(dice_soft_np_TN(seg_data.numpy(), prediction))
+    # print(seg_data.numpy().shape)
     all_y_true.append(y_true)
     all_y_pred.append(y_pred)
 
@@ -391,8 +480,18 @@ for k, sample in enumerate(val_dataset_raw):
 
     for i in range(num_classes - 1):
         ground_truth = label(seg_data_orig[..., i])
+        # print(ground_truth.shape)
+        # plt.imshow(ground_truth)
+        # plt.show()
         prediction_cls = label(prediction[..., i])
+        # print(prediction_cls.shape)
+        # plt.imshow(prediction_cls)
+        # plt.show()
+
         props_prediction = [p for p in regionprops(prediction_cls) if p.area > 100]
+        # print(props_prediction)
+        # plt.show()
+
         props_gt = [p for p in regionprops(ground_truth)]
 
         prediction_boxes.extend([p.bbox for p in props_prediction])
@@ -403,21 +502,31 @@ for k, sample in enumerate(val_dataset_raw):
 
         if prediction_boxes:
             y_pred[i] = 1
-
-    if k < 100:
+    # print(y_true)
+    if k > 1:
+    #
+    #     visualize_detections(img_data_orig, gt_boxes, gt_classes, "Ground Thruth")
+    #     visualize_detections(img_data, prediction_boxes, prediction_classes, "Model Predictions")
         break
-        # visualize_detections(img_data_orig, gt_boxes, gt_classes, "Ground Thruth")
-        # visualize_detections(img_data, prediction_boxes, prediction_classes, "Model Predictions")
 
 # In[ ]:
 
+# print('Dices')
 
+print(len(all_dice_scores))
 print("Complete DSC")
 print(list(zip(cat_names, np.array(all_dice_scores).mean(axis=0))))
 
 print("Classification report")
 print(classification_report(np.array(all_y_true), np.array(all_y_pred), target_names=cat_names))
-
+yy=classification_report(np.array(all_y_true), np.array(all_y_pred), target_names=cat_names)
+print(type(yy))
+# sfpath = 'keycode/my-gpysheets-3d8d13442005.json'
+# sheetID = '13Dd30LxaBXVaBpeBXmVboZzxhysJd-ep5m6l3fIooMM'
+# sheetName = 'Dice-No-TN-2'
+# write_to_gsheet(sfpath, sheetID, sheetName,pd.DataFrame(all_dice_scores))
+# sheetName = 'Classification'
+# write_to_gsheet(sfpath, sheetID, sheetName,pd.DataFrame(classification_report(np.array(all_y_true), np.array(all_y_pred), target_names=cat_names)))
 # In[ ]:
 
 
@@ -487,14 +596,14 @@ def evaluate_coco(model, dataset, coco, eval_type="bbox"):
 # In[ ]:
 
 
-path_common = "tensorflow_datasets"
-
-coco_path = os.path.join(path_common, 'glenda_coco2', 'glenda_full_v3.json')
-# coco_path = 'tensorflow_datasets/glenda_coco2/4.0.0/features.json'
-
-
-coco_annotation = COCO(annotation_file=coco_path)
-
-coco_eval = evaluate_coco(model, val_dataset_raw, coco_annotation)
-
-# In[ ]:
+# path_common = "tensorflow_datasets"
+#
+# coco_path = os.path.join(path_common, 'glenda_coco2', 'glenda_full_v3.json')
+# # coco_path = 'tensorflow_datasets/glenda_coco2/4.0.0/features.json'
+#
+#
+# coco_annotation = COCO(annotation_file=coco_path)
+#
+# coco_eval = evaluate_coco(model, val_dataset_raw, coco_annotation)
+#
+# # In[ ]:
